@@ -272,8 +272,13 @@ def main(model_id, output_path):
             if match:
                 layer_idx = int(match.group(1))
                 if layer_idx not in moe_info:
-                    # Count experts in this layer
-                    num_experts = len([n for n, _ in module.named_modules() if n.isdigit()])
+                    # Count experts in this layer - handle GLM's expert structure
+                    if hasattr(module, '__len__'):
+                        num_experts = len(module)
+                    else:
+                        # For GLM, experts might be stored differently
+                        num_experts = len([n for n, _ in module.named_modules() if n.isdigit()])
+                    
                     moe_info[layer_idx] = {
                         'num_experts': num_experts,
                         'has_shared_experts': any('shared_experts' in n for n, _ in lm_model.named_modules()
@@ -318,8 +323,17 @@ def main(model_id, output_path):
 
         print(f"Modifying layer {layer_index + 1}/{num_layers}")
         
+        # Debug: Print layer structure
+        layer = lm_model.layers[layer_index]
+        print(f"  Layer structure: {type(layer).__name__}")
+        if hasattr(layer, 'mlp'):
+            print(f"  MLP type: {type(layer.mlp).__name__}")
+            if hasattr(layer.mlp, 'experts'):
+                print(f"  Has experts: {type(layer.mlp.experts).__name__}")
+        
         # Check if this is an MoE layer
         is_moe_layer = is_moe and layer_index in moe_info
+        print(f"  Is MoE layer: {is_moe_layer}")
         
         if is_moe_layer:
             # For MoE layers, we need to modify all experts and the gate
@@ -333,18 +347,40 @@ def main(model_id, output_path):
             
             # Modify all experts in the MoE layer
             if not SKIP_MLP and hasattr(lm_model.layers[layer_index], 'mlp'):
-                # For each expert
+                mlp_module = lm_model.layers[layer_index].mlp
+                
+                # For each expert - handle both standard and GLM expert access patterns
                 for expert_idx in range(moe_info[layer_index]['num_experts']):
-                    expert_path = f"mlp.experts.{expert_idx}"
-                    if hasattr(lm_model.layers[layer_index], expert_path):
-                        expert = getattr(lm_model.layers[layer_index].mlp.experts, str(expert_idx))
-                        
+                    expert = None
+                    
+                    # Try GLM-style expert access (experts is a list/module)
+                    if hasattr(mlp_module, 'experts'):
+                        try:
+                            # Try accessing as a list first (GLM style)
+                            if hasattr(mlp_module.experts, '__getitem__'):
+                                expert = mlp_module.experts[expert_idx]
+                            # Try accessing by string index (fallback)
+                            elif hasattr(mlp_module.experts, str(expert_idx)):
+                                expert = getattr(mlp_module.experts, str(expert_idx))
+                            # Try accessing by named modules
+                            else:
+                                for name, module in mlp_module.experts.named_modules():
+                                    if name == str(expert_idx):
+                                        expert = module
+                                        break
+                        except (IndexError, AttributeError):
+                            print(f"    Warning: Could not access expert {expert_idx}")
+                            continue
+                    
+                    if expert is not None:
                         # Modify expert's down_proj
                         if hasattr(expert, 'down_proj'):
                             expert.down_proj.weight = modify_tensor(
                                 expert.down_proj.weight.data.to(torch.float32), householder_matrix
                             )
                             print(f"    Modified expert {expert_idx} down_proj")
+                        else:
+                            print(f"    Warning: Expert {expert_idx} has no down_proj")
                 
                 # Modify shared experts if they exist
                 if moe_info[layer_index]['has_shared_experts'] and hasattr(lm_model.layers[layer_index].mlp, 'shared_experts'):
