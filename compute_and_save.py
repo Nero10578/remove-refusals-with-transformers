@@ -373,23 +373,49 @@ def main(model_id, output_path):
                             continue
                     
                     if expert is not None:
-                        # Modify expert's down_proj
+                        # Modify expert's projections - handle different MLP architectures
                         if hasattr(expert, 'down_proj'):
                             expert.down_proj.weight = modify_tensor(
                                 expert.down_proj.weight.data.to(torch.float32), householder_matrix
                             )
                             print(f"    Modified expert {expert_idx} down_proj")
-                        else:
-                            print(f"    Warning: Expert {expert_idx} has no down_proj")
+                        
+                        if hasattr(expert, 'gate_proj'):
+                            expert.gate_proj.weight = modify_tensor(
+                                expert.gate_proj.weight.data.to(torch.float32), householder_matrix
+                            )
+                            print(f"    Modified expert {expert_idx} gate_proj")
+                        
+                        if hasattr(expert, 'up_proj'):
+                            expert.up_proj.weight = modify_tensor(
+                                expert.up_proj.weight.data.to(torch.float32), householder_matrix
+                            )
+                            print(f"    Modified expert {expert_idx} up_proj")
+                        
+                        if not (hasattr(expert, 'down_proj') or hasattr(expert, 'gate_proj') or hasattr(expert, 'up_proj')):
+                            print(f"    Warning: Expert {expert_idx} has no recognizable MLP projections")
                 
                 # Modify shared experts if they exist
-                if moe_info[layer_index]['has_shared_experts'] and hasattr(lm_model.layers[layer_index].mlp, 'shared_experts'):
-                    shared_expert = lm_model.layers[layer_index].mlp.shared_experts
+                if moe_info[layer_index]['has_shared_experts'] and hasattr(mlp_module, 'shared_experts'):
+                    shared_expert = mlp_module.shared_experts
+                    
                     if hasattr(shared_expert, 'down_proj'):
                         shared_expert.down_proj.weight = modify_tensor(
                             shared_expert.down_proj.weight.data.to(torch.float32), householder_matrix
                         )
                         print(f"    Modified shared_expert down_proj")
+                    
+                    if hasattr(shared_expert, 'gate_proj'):
+                        shared_expert.gate_proj.weight = modify_tensor(
+                            shared_expert.gate_proj.weight.data.to(torch.float32), householder_matrix
+                        )
+                        print(f"    Modified shared_expert gate_proj")
+                    
+                    if hasattr(shared_expert, 'up_proj'):
+                        shared_expert.up_proj.weight = modify_tensor(
+                            shared_expert.up_proj.weight.data.to(torch.float32), householder_matrix
+                        )
+                        print(f"    Modified shared_expert up_proj")
                 
                 # Modify the gate if it exists
                 if moe_info[layer_index]['has_gate'] and hasattr(lm_model.layers[layer_index].mlp, 'gate'):
@@ -410,12 +436,27 @@ def main(model_id, output_path):
             
             # Modify MLP projection if needed
             if not SKIP_MLP and hasattr(lm_model.layers[layer_index], 'mlp'):
-                # For standard MLP layers (like layer 0)
-                if hasattr(lm_model.layers[layer_index].mlp, 'down_proj'):
-                    lm_model.layers[layer_index].mlp.down_proj.weight = modify_tensor(
-                        lm_model.layers[layer_index].mlp.down_proj.weight.data.to(torch.float32), householder_matrix
+                mlp = lm_model.layers[layer_index].mlp
+                
+                # Handle different MLP architectures
+                if hasattr(mlp, 'down_proj'):
+                    mlp.down_proj.weight = modify_tensor(
+                        mlp.down_proj.weight.data.to(torch.float32), householder_matrix
                     )
-                    print(f"    Modified standard MLP down_proj")
+                    print(f"    Modified MLP down_proj")
+                
+                # Some models (like Mistral, GLM) have gate_proj, others (like Apertus) don't
+                if hasattr(mlp, 'gate_proj'):
+                    mlp.gate_proj.weight = modify_tensor(
+                        mlp.gate_proj.weight.data.to(torch.float32), householder_matrix
+                    )
+                    print(f"    Modified MLP gate_proj")
+                
+                if hasattr(mlp, 'up_proj'):
+                    mlp.up_proj.weight = modify_tensor(
+                        mlp.up_proj.weight.data.to(torch.float32), householder_matrix
+                    )
+                    print(f"    Modified MLP up_proj")
 
     bar_tensors.close()
 
