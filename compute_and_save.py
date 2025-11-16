@@ -291,7 +291,25 @@ def main(model_id, output_path):
 
     # By performing a (left-only) Householder transformation we reflect the matrix in the row space (ie: the linear weighted sums / "units").
     # NOTE: Down cast back to bfloat16 to save out in the same format as the un-modified tensors.
-    def modify_tensor(weight_matrix, householder_matrix):
+    def modify_tensor(weight_matrix, householder_vector):
+        # The Householder vector dimension should match the input dimension of the weight matrix
+        input_dim = weight_matrix.shape[1]
+        
+        # If householder_vector dimension doesn't match, we need to project or resize it
+        if householder_vector.size(0) != input_dim:
+            # Project the householder_vector to the correct dimension if it's larger
+            if householder_vector.size(0) > input_dim:
+                householder_vector = householder_vector[:input_dim]
+            else:
+                # If it's smaller, we need to pad it (this shouldn't happen with proper models)
+                padding = torch.zeros(input_dim - householder_vector.size(0), dtype=householder_vector.dtype, device=householder_vector.device)
+                householder_vector = torch.cat([householder_vector, padding])
+        
+        # Calculate the Householder matrix for this specific weight matrix
+        identity_matrix = torch.eye(input_dim, dtype=torch.float32, device=householder_vector.device)
+        outer_product_matrix = torch.outer(householder_vector, householder_vector)
+        householder_matrix = identity_matrix - 2 * outer_product_matrix
+        
         weight_matrix = torch.matmul(householder_matrix, weight_matrix).to(torch.bfloat16)
         bar_tensors.update(1)
         return torch.nn.Parameter(weight_matrix)
@@ -331,7 +349,7 @@ def main(model_id, output_path):
             # Modify attention projection if needed
             if not SKIP_ATTN and hasattr(lm_model.layers[layer_index], 'self_attn'):
                 lm_model.layers[layer_index].self_attn.o_proj.weight = modify_tensor(
-                    lm_model.layers[layer_index].self_attn.o_proj.weight.data.to(torch.float32), householder_matrix
+                    lm_model.layers[layer_index].self_attn.o_proj.weight.data.to(torch.float32), householder_vector
                 )
             
             # Modify all experts in the MoE layer
@@ -362,55 +380,31 @@ def main(model_id, output_path):
                             continue
                     
                     if expert is not None:
-                        # Modify expert's projections - handle different MLP architectures
+                        # Only modify expert's down_proj to match original behavior
                         if hasattr(expert, 'down_proj'):
                             expert.down_proj.weight = modify_tensor(
-                                expert.down_proj.weight.data.to(torch.float32), householder_matrix
+                                expert.down_proj.weight.data.to(torch.float32), householder_vector
                             )
                             print(f"    Modified expert {expert_idx} down_proj")
-                        
-                        if hasattr(expert, 'gate_proj'):
-                            expert.gate_proj.weight = modify_tensor(
-                                expert.gate_proj.weight.data.to(torch.float32), householder_matrix
-                            )
-                            print(f"    Modified expert {expert_idx} gate_proj")
-                        
-                        if hasattr(expert, 'up_proj'):
-                            expert.up_proj.weight = modify_tensor(
-                                expert.up_proj.weight.data.to(torch.float32), householder_matrix
-                            )
-                            print(f"    Modified expert {expert_idx} up_proj")
-                        
-                        if not (hasattr(expert, 'down_proj') or hasattr(expert, 'gate_proj') or hasattr(expert, 'up_proj')):
-                            print(f"    Warning: Expert {expert_idx} has no recognizable MLP projections")
+                        else:
+                            print(f"    Warning: Expert {expert_idx} has no down_proj")
                 
                 # Modify shared experts if they exist
                 if moe_info[layer_index]['has_shared_experts'] and hasattr(mlp_module, 'shared_experts'):
                     shared_expert = mlp_module.shared_experts
                     
+                    # Only modify shared_expert down_proj to match original behavior
                     if hasattr(shared_expert, 'down_proj'):
                         shared_expert.down_proj.weight = modify_tensor(
-                            shared_expert.down_proj.weight.data.to(torch.float32), householder_matrix
+                            shared_expert.down_proj.weight.data.to(torch.float32), householder_vector
                         )
                         print(f"    Modified shared_expert down_proj")
-                    
-                    if hasattr(shared_expert, 'gate_proj'):
-                        shared_expert.gate_proj.weight = modify_tensor(
-                            shared_expert.gate_proj.weight.data.to(torch.float32), householder_matrix
-                        )
-                        print(f"    Modified shared_expert gate_proj")
-                    
-                    if hasattr(shared_expert, 'up_proj'):
-                        shared_expert.up_proj.weight = modify_tensor(
-                            shared_expert.up_proj.weight.data.to(torch.float32), householder_matrix
-                        )
-                        print(f"    Modified shared_expert up_proj")
                 
                 # Modify the gate if it exists
                 if moe_info[layer_index]['has_gate'] and hasattr(lm_model.layers[layer_index].mlp, 'gate'):
                     gate = lm_model.layers[layer_index].mlp.gate
                     gate.weight = modify_tensor(
-                        gate.weight.data.to(torch.float32), householder_matrix
+                        gate.weight.data.to(torch.float32), householder_vector
                     )
                     print(f"    Modified gate")
         else:
@@ -420,32 +414,19 @@ def main(model_id, output_path):
             # Modify attention projection if needed
             if not SKIP_ATTN and hasattr(lm_model.layers[layer_index], 'self_attn'):
                 lm_model.layers[layer_index].self_attn.o_proj.weight = modify_tensor(
-                    lm_model.layers[layer_index].self_attn.o_proj.weight.data.to(torch.float32), householder_matrix
+                    lm_model.layers[layer_index].self_attn.o_proj.weight.data.to(torch.float32), householder_vector
                 )
             
-            # Modify MLP projection if needed
+            # Modify MLP projection if needed - only down_proj like in original
             if not SKIP_MLP and hasattr(lm_model.layers[layer_index], 'mlp'):
                 mlp = lm_model.layers[layer_index].mlp
                 
-                # Handle different MLP architectures
+                # Only modify down_proj to match original behavior
                 if hasattr(mlp, 'down_proj'):
                     mlp.down_proj.weight = modify_tensor(
-                        mlp.down_proj.weight.data.to(torch.float32), householder_matrix
+                        mlp.down_proj.weight.data.to(torch.float32), householder_vector
                     )
                     print(f"    Modified MLP down_proj")
-                
-                # Some models (like Mistral, GLM) have gate_proj, others (like Apertus) don't
-                if hasattr(mlp, 'gate_proj'):
-                    mlp.gate_proj.weight = modify_tensor(
-                        mlp.gate_proj.weight.data.to(torch.float32), householder_matrix
-                    )
-                    print(f"    Modified MLP gate_proj")
-                
-                if hasattr(mlp, 'up_proj'):
-                    mlp.up_proj.weight = modify_tensor(
-                        mlp.up_proj.weight.data.to(torch.float32), householder_matrix
-                    )
-                    print(f"    Modified MLP up_proj")
 
     bar_tensors.close()
 
