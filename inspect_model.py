@@ -74,28 +74,73 @@ def inspect_model(model_id):
         # Inspect first layer to understand the pattern
         first_layer = model.model.layers[0]
         layer_components = {}
+        detailed_structure = {}
         
+        print(f"\nFirst layer detailed structure:")
         for name, submodule in first_layer.named_children():
             module_type = type(submodule).__name__
             layer_components[name] = module_type
+            detailed_structure[name] = {"type": module_type, "subcomponents": {}}
             
             # Get weight shapes for key components
             if hasattr(submodule, 'weight') and submodule.weight is not None:
                 weight_shape = tuple(submodule.weight.shape)
                 print(f"  {name}: {module_type} (weight shape: {weight_shape})")
                 layer_components[f"{name}_weight_shape"] = weight_shape
+                detailed_structure[name]["weight_shape"] = weight_shape
             else:
                 print(f"  {name}: {module_type}")
+            
+            # Get detailed subcomponents for important modules
+            if any(important in name.lower() for important in ['attn', 'mlp', 'attention']):
+                for sub_name, sub_submodule in submodule.named_children():
+                    sub_type = type(sub_submodule).__name__
+                    detailed_structure[name]["subcomponents"][sub_name] = {"type": sub_type}
+                    
+                    if hasattr(sub_submodule, 'weight') and sub_submodule.weight is not None:
+                        sub_weight_shape = tuple(sub_submodule.weight.shape)
+                        print(f"    {sub_name}: {sub_type} (weight shape: {sub_weight_shape})")
+                        detailed_structure[name]["subcomponents"][sub_name]["weight_shape"] = sub_weight_shape
+                    else:
+                        print(f"    {sub_name}: {sub_type}")
+                    
+                    # Go one level deeper for linear/dense layers
+                    if any(important in sub_type.lower() for important in ['linear', 'dense']):
+                        for sub_sub_name, sub_sub_submodule in sub_submodule.named_children():
+                            if hasattr(sub_sub_submodule, 'weight') and sub_sub_submodule.weight is not None:
+                                sub_sub_weight_shape = tuple(sub_sub_submodule.weight.shape)
+                                print(f"      {sub_sub_name}: weight shape {sub_sub_weight_shape}")
+                                detailed_structure[name]["subcomponents"][sub_name][f"{sub_sub_name}_weight_shape"] = sub_sub_weight_shape
             
             # Special handling for MLP with experts
             if name == 'mlp' and hasattr(submodule, 'experts'):
                 num_experts = len(submodule.experts)
                 print(f"    Number of experts: {num_experts}")
                 layer_components[f"{name}_num_experts"] = num_experts
+                detailed_structure[name]["num_experts"] = num_experts
+                
+                # Show first expert structure
+                if len(submodule.experts) > 0:
+                    first_expert = submodule.experts[0]
+                    print(f"    First expert structure:")
+                    expert_structure = {}
+                    for expert_name, expert_submodule in first_expert.named_children():
+                        expert_type = type(expert_submodule).__name__
+                        expert_structure[expert_name] = {"type": expert_type}
+                        
+                        if hasattr(expert_submodule, 'weight') and expert_submodule.weight is not None:
+                            expert_weight_shape = tuple(expert_submodule.weight.shape)
+                            print(f"      {expert_name}: {expert_type} (weight shape: {expert_weight_shape})")
+                            expert_structure[expert_name]["weight_shape"] = expert_weight_shape
+                        else:
+                            print(f"      {expert_name}: {expert_type}")
+                    
+                    detailed_structure[name]["expert_structure"] = expert_structure
         
         architecture_info["layer_info"]["layer_structure"] = layer_components
+        architecture_info["layer_info"]["detailed_structure"] = detailed_structure
     
-    # Parameter summary (not detailed list)
+    # Parameter summary and naming patterns
     print("\n=== PARAMETER SUMMARY ===")
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -103,9 +148,60 @@ def inspect_model(model_id):
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
     
+    # Analyze parameter naming patterns
+    print("\n=== PARAMETER NAMING PATTERNS ===")
+    param_names = [name for name, _ in model.named_parameters()]
+    
+    # Extract unique parameter patterns
+    param_patterns = {}
+    layer_param_patterns = {}
+    
+    for name in param_names:
+        # Get the pattern by removing layer numbers and indices
+        pattern_parts = name.split('.')
+        pattern = []
+        
+        for part in pattern_parts:
+            # Replace numeric indices with placeholders
+            if part.isdigit():
+                pattern.append('[layer_idx]')
+            else:
+                pattern.append(part)
+        
+        pattern_str = '.'.join(pattern)
+        
+        if pattern_str not in param_patterns:
+            param_patterns[pattern_str] = []
+        param_patterns[pattern_str].append(name)
+        
+        # Also group by layer if this is a layer parameter
+        if 'layers' in pattern_parts:
+            layer_idx_idx = pattern_parts.index('layers') + 1
+            if layer_idx_idx < len(pattern_parts):
+                layer_idx = pattern_parts[layer_idx_idx]
+                if layer_idx.isdigit():
+                    if layer_idx not in layer_param_patterns:
+                        layer_param_patterns[layer_idx] = []
+                    layer_param_patterns[layer_idx].append(name)
+    
+    # Show unique parameter patterns
+    print("Unique parameter patterns:")
+    for pattern, examples in sorted(param_patterns.items()):
+        count = len(examples)
+        example = examples[0] if examples else ""
+        print(f"  {pattern}: {count} parameters (e.g., {example})")
+    
+    # Show parameter patterns for first layer
+    if '0' in layer_param_patterns:
+        print(f"\nFirst layer parameter patterns:")
+        for param_name in sorted(layer_param_patterns['0']):
+            print(f"  {param_name}")
+    
     architecture_info["parameter_summary"] = {
         "total_parameters": total_params,
-        "trainable_parameters": trainable_params
+        "trainable_parameters": trainable_params,
+        "unique_patterns": param_patterns,
+        "first_layer_params": layer_param_patterns.get('0', [])
     }
     
     # Save concise architecture info to JSON file
