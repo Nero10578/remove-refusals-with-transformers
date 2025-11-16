@@ -29,8 +29,8 @@ def main(model_id, output_path):
     SKIP_MLP = False
 
     torch.inference_mode()
+    torch.set_default_device("cpu")
     torch.set_grad_enabled(False)
-    # Don't set default device to CPU, let GPU handle tensors
 
     # Load the model on the GPU in quantized type if we can.
     model = AutoModelForCausalLM.from_pretrained(
@@ -40,17 +40,15 @@ def main(model_id, output_path):
         quantization_config=BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16),
         low_cpu_mem_usage=True,
         device_map='auto',
-        # Try to use flash attention if available, otherwise fall back
-        attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager",
+        attn_implementation="flash_attention_2",
     )
     model.requires_grad_(False)
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    # Ensure pad token is set before configuring padding side
+    # Ensure pad token is set
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    # Set padding side to left for decoder-only models
-    tokenizer.padding_side = 'left'
+    # Don't modify padding_side - keep original behavior
     
     # Number of layers
     num_layers = len(model.model.layers)
@@ -94,11 +92,11 @@ def main(model_id, output_path):
 
     def generate_batch(tokens_batch, max_new_tokens):
         """Generate for a batch of prompts and return hidden states by layer"""
-        # Create attention mask to handle padding
+        # Create attention mask to handle padding (1 for real tokens, 0 for padding)
         attention_mask = torch.ones_like(tokens_batch)
         attention_mask[tokens_batch == (tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id)] = 0
         
-        # Use more efficient generation settings
+        # Use more efficient generation settings - match original behavior exactly
         output = model.generate(
             tokens_batch,
             attention_mask=attention_mask,
@@ -106,27 +104,18 @@ def main(model_id, output_path):
             max_new_tokens=max_new_tokens,
             return_dict_in_generate=True,
             output_hidden_states=True,
-            pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
-            do_sample=False,  # Use greedy decoding for consistency
-            temperature=1.0,
-            top_p=1.0,
+            pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
         )
         
-        # Get hidden states for each sample in the batch - vectorized approach
+        # Get hidden states for each sample in the batch - match original extraction exactly
         batch_size = tokens_batch.shape[0]
-        num_layers = len(output.hidden_states[-1]) - 1  # Exclude the first hidden state
-        
-        # Extract hidden states for all samples at once
-        batch_hidden_states_by_layer = []
-        for layer_idx in range(1, num_layers + 1):  # Skip index 0 as in original
-            layer_hidden_states = output.hidden_states[-1][layer_idx][:, -1, :]  # All samples, last token
-            batch_hidden_states_by_layer.append(layer_hidden_states)
-        
-        # Transpose to get list of samples, each with all layer states
         samples_hidden_states = []
+        
         for sample_idx in range(batch_size):
-            sample_states = [layer_states[sample_idx] for layer_states in batch_hidden_states_by_layer]
-            samples_hidden_states.append(sample_states)
+            # Extract hidden states exactly as in original: hidden_states[-1][1:] and [:, -1, :]
+            hidden_states_by_layer = [hidden_state[sample_idx, -1, :].squeeze().to('cpu')
+                                    for hidden_state in output.hidden_states[-1][1:]]
+            samples_hidden_states.append(hidden_states_by_layer)
         
         bar_generate.update(n=batch_size)
         return samples_hidden_states
@@ -142,7 +131,7 @@ def main(model_id, output_path):
             # Ensure all tensors are on the same device (use the first tensor's device)
             target_device = batch[0].device
             
-            # Pad all tensors to the same length (left padding for decoder-only models)
+            # Pad all tensors to the same length (right padding to match original behavior)
             padded_batch = []
             for t in batch:
                 # Move tensor to target device if needed
@@ -152,8 +141,8 @@ def main(model_id, output_path):
                     padding = torch.full((t.shape[0], max_len - t.shape[1]),
                                        tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
                                        dtype=t.dtype, device=target_device)
-                    # Left padding: concatenate padding first, then the original tokens
-                    padded_t = torch.cat([padding, t], dim=1)
+                    # Right padding: concatenate original tokens first, then padding
+                    padded_t = torch.cat([t, padding], dim=1)
                 else:
                     padded_t = t
                 padded_batch.append(padded_t)
