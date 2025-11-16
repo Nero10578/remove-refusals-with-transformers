@@ -184,24 +184,38 @@ def inspect_model(model_id):
                         layer_param_patterns[layer_idx] = []
                     layer_param_patterns[layer_idx].append(name)
     
-    # Show unique parameter patterns
+    # Show concise parameter patterns summary
     print("Unique parameter patterns:")
     for pattern, examples in sorted(param_patterns.items()):
         count = len(examples)
-        example = examples[0] if examples else ""
-        print(f"  {pattern}: {count} parameters (e.g., {example})")
+        # Only show the pattern and count, not all examples
+        print(f"  {pattern}: {count} parameters")
     
-    # Show parameter patterns for first layer
+    # Show first layer parameter structure (pattern, not all instances)
     if '0' in layer_param_patterns:
-        print(f"\nFirst layer parameter patterns:")
+        print(f"\nFirst layer parameter structure:")
         for param_name in sorted(layer_param_patterns['0']):
-            print(f"  {param_name}")
+            # Remove the layer index to show the pattern
+            pattern = param_name.replace('layers.0.', 'layers.[i].')
+            print(f"  {pattern}")
+    
+    # Create a concise parameter structure summary
+    param_structure_summary = {}
+    for pattern, examples in param_patterns.items():
+        param_structure_summary[pattern] = len(examples)
+    
+    # Get first layer structure without the specific layer index
+    first_layer_structure = []
+    if '0' in layer_param_patterns:
+        for param_name in sorted(layer_param_patterns['0']):
+            pattern = param_name.replace('layers.0.', 'layers.[i].')
+            first_layer_structure.append(pattern)
     
     architecture_info["parameter_summary"] = {
         "total_parameters": total_params,
         "trainable_parameters": trainable_params,
-        "unique_patterns": param_patterns,
-        "first_layer_params": layer_param_patterns.get('0', [])
+        "param_structure_summary": param_structure_summary,
+        "first_layer_structure": first_layer_structure
     }
     
     # Save concise architecture info to JSON file
