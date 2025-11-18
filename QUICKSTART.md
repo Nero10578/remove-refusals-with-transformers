@@ -44,11 +44,21 @@ You can also use:
 
 ### Step 2: Run the Script
 
-**Basic command:**
+**Basic command (works for all models):**
 ```bash
 python bake_refusal_ablation.py \
     --model_id "stabilityai/stablelm-2-zephyr-1_6b" \
     --output_path "./my_modified_model"
+```
+
+This modifies both attention and MLP layers by default (matching the original inference.py behavior).
+
+**To only modify attention layers (not recommended):**
+```bash
+python bake_refusal_ablation.py \
+    --model_id "stabilityai/stablelm-2-zephyr-1_6b" \
+    --output_path "./my_modified_model" \
+    --no-modify_mlp
 ```
 
 **On Windows (use `^` for line continuation):**
@@ -203,6 +213,39 @@ python bake_refusal_ablation.py \
     --harmful_file "my_harmful.txt" \
     --harmless_file "my_harmless.txt"
 ```
+
+### Mixture of Experts (MoE) Models
+
+MoE models work automatically with the default settings:
+
+```bash
+python bake_refusal_ablation.py \
+    --model_id "Qwen/Qwen1.5-MoE-A2.7B-Chat" \
+    --output_path "./my_modified_model" \
+    --num_instructions 64
+```
+
+The script automatically detects MoE architecture and will:
+- Modify self-attention output projections
+- Modify all expert down_proj layers
+- Modify shared expert layers (if present)
+- Handle different MoE implementations (Qwen, DeepSeek, Mixtral, etc.)
+
+**Supported MoE models:**
+- Qwen MoE models (Qwen1.5-MoE-A2.7B-Chat, etc.)
+- DeepSeek MoE models
+- Mixtral models
+- Other MoE architectures with standard structure
+
+### What Gets Modified
+
+By default (recommended):
+- ✅ Self-attention output projections (o_proj)
+- ✅ MLP down projections (down_proj) - for standard models
+- ✅ All expert down projections - for MoE models
+- ✅ Shared expert down projections - for MoE models with shared experts
+
+This matches the original inference.py behavior where ablation layers are inserted between every transformer layer.
 
 ## Troubleshooting
 

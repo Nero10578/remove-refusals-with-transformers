@@ -107,7 +107,7 @@ def compute_refusal_direction(model, tokenizer, harmful_file="harmful.txt",
     return refusal_dir, layer_idx
 
 
-def apply_ablation_to_weights(model, refusal_dir):
+def apply_ablation_to_weights(model, refusal_dir, modify_mlp=False):
     """
     Modify model weights to pre-apply the refusal direction ablation.
     
@@ -125,45 +125,130 @@ def apply_ablation_to_weights(model, refusal_dir):
                        = (W - v @ (W^T @ v)^T) @ x
     
     So we modify: W_new = W - v @ (W^T @ v)^T
+    
+    Args:
+        model: The model to modify
+        refusal_dir: The refusal direction vector
+        modify_mlp: Whether to also modify MLP layers (for MoE models)
     """
     print("\nModifying model weights to bake in ablation...")
     
     # Ensure refusal_dir is on CPU and in float32 for precision
     refusal_dir = refusal_dir.cpu().float()
     
-    num_layers = len(model.model.layers)
+    # Get the language model component
+    lm_model = model.model
+    num_layers = len(lm_model.layers)
+    
+    # Detect MoE architecture
+    is_moe = False
+    moe_info = {}
+    for name, module in lm_model.named_modules():
+        if 'mlp.experts' in name:
+            is_moe = True
+            # Extract layer index
+            match = re.search(r'layers\.(\d+)\.mlp\.experts', name)
+            if match:
+                layer_idx = int(match.group(1))
+                if layer_idx not in moe_info:
+                    # Count experts in this layer
+                    if hasattr(module, '__len__'):
+                        num_experts = len(module)
+                    else:
+                        # For some models, experts might be stored differently
+                        num_experts = len([n for n, _ in module.named_modules() if n.isdigit()])
+                    
+                    moe_info[layer_idx] = {
+                        'num_experts': num_experts,
+                        'has_shared_experts': any('shared_experts' in n for n, _ in lm_model.named_modules()
+                                                if f'layers.{layer_idx}.mlp' in n),
+                        'has_gate': any('gate' in n and 'experts' not in n
+                                     for n, _ in lm_model.named_modules()
+                                     if f'layers.{layer_idx}.mlp' in n)
+                    }
+    
+    if is_moe:
+        print(f"Detected Mixture of Experts (MoE) model with {len(moe_info)} MoE layers")
+        for layer_idx, info in moe_info.items():
+            print(f"  Layer {layer_idx}: {info['num_experts']} experts, "
+                  f"shared_experts={info['has_shared_experts']}, gate={info['has_gate']}")
+    
+    def modify_weight_matrix(weight, name=""):
+        """Helper function to modify a weight matrix"""
+        W = weight.data.cpu().float()  # [output_dim, input_dim]
+        
+        # Ensure refusal_dir matches the output dimension
+        output_dim = W.shape[0]
+        if refusal_dir.shape[0] != output_dim:
+            print(f"  Warning: {name} output dim {output_dim} != refusal_dir dim {refusal_dir.shape[0]}, skipping")
+            return None
+        
+        # Compute the ablation modification: W_new = W - v @ (W^T @ v)^T
+        Wt_v = W.T @ refusal_dir  # [input_dim]
+        ablation_matrix = torch.outer(refusal_dir, Wt_v)  # [output_dim, input_dim]
+        W_new = W - ablation_matrix
+        
+        return W_new.to(weight.dtype).to(weight.device)
+    
     bar = tqdm(total=num_layers, desc="Modifying layers")
     
     for layer_idx in range(num_layers):
-        layer = model.model.layers[layer_idx]
+        layer = lm_model.layers[layer_idx]
+        is_moe_layer = is_moe and layer_idx in moe_info
         
-        # Modify the self-attention output projection
-        # This is where the ablation layers were inserted in the original inference.py
+        # Modify self-attention output projection (always done)
         if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'o_proj'):
-            o_proj = layer.self_attn.o_proj
-            W = o_proj.weight.data.cpu().float()  # [output_dim, input_dim]
-            
-            # Ensure refusal_dir matches the output dimension
-            output_dim = W.shape[0]
-            if refusal_dir.shape[0] != output_dim:
-                # If dimensions don't match, we need to handle this
-                # This could happen if the refusal_dir was computed at a different layer
-                print(f"Warning: Layer {layer_idx} output dim {output_dim} != refusal_dir dim {refusal_dir.shape[0]}")
-                # Skip this layer or pad/truncate as needed
-                bar.update(1)
-                continue
-            
-            # Compute the ablation modification: W_new = W - v @ (W^T @ v)^T
-            # W^T @ v gives us how much each input dimension contributes to the refusal direction
-            Wt_v = W.T @ refusal_dir  # [input_dim]
-            # v @ (W^T @ v)^T creates the rank-1 update matrix
-            ablation_matrix = torch.outer(refusal_dir, Wt_v)  # [output_dim, input_dim]
-            
-            # Apply the modification
-            W_new = W - ablation_matrix
-            
-            # Update the weight (convert back to original dtype)
-            o_proj.weight.data = W_new.to(o_proj.weight.dtype).to(o_proj.weight.device)
+            modified = modify_weight_matrix(layer.self_attn.o_proj.weight,
+                                          f"Layer {layer_idx} self_attn.o_proj")
+            if modified is not None:
+                layer.self_attn.o_proj.weight.data = modified
+        
+        # Modify MLP layers if requested (useful for MoE models)
+        if modify_mlp and hasattr(layer, 'mlp'):
+            if is_moe_layer:
+                # Handle MoE layer
+                mlp_module = layer.mlp
+                
+                # Modify each expert's down_proj
+                for expert_idx in range(moe_info[layer_idx]['num_experts']):
+                    expert = None
+                    
+                    # Try to access expert
+                    if hasattr(mlp_module, 'experts'):
+                        try:
+                            if hasattr(mlp_module.experts, '__getitem__'):
+                                expert = mlp_module.experts[expert_idx]
+                            elif hasattr(mlp_module.experts, str(expert_idx)):
+                                expert = getattr(mlp_module.experts, str(expert_idx))
+                            else:
+                                for name, module in mlp_module.experts.named_modules():
+                                    if name == str(expert_idx):
+                                        expert = module
+                                        break
+                        except (IndexError, AttributeError):
+                            continue
+                    
+                    if expert is not None and hasattr(expert, 'down_proj'):
+                        modified = modify_weight_matrix(expert.down_proj.weight,
+                                                      f"Layer {layer_idx} expert {expert_idx} down_proj")
+                        if modified is not None:
+                            expert.down_proj.weight.data = modified
+                
+                # Modify shared experts if they exist
+                if moe_info[layer_idx]['has_shared_experts'] and hasattr(mlp_module, 'shared_experts'):
+                    shared_expert = mlp_module.shared_experts
+                    if hasattr(shared_expert, 'down_proj'):
+                        modified = modify_weight_matrix(shared_expert.down_proj.weight,
+                                                      f"Layer {layer_idx} shared_expert down_proj")
+                        if modified is not None:
+                            shared_expert.down_proj.weight.data = modified
+            else:
+                # Handle standard MLP layer
+                if hasattr(layer.mlp, 'down_proj'):
+                    modified = modify_weight_matrix(layer.mlp.down_proj.weight,
+                                                  f"Layer {layer_idx} mlp.down_proj")
+                    if modified is not None:
+                        layer.mlp.down_proj.weight.data = modified
         
         bar.update(1)
     
@@ -171,8 +256,8 @@ def apply_ablation_to_weights(model, refusal_dir):
     print("Weight modification complete!")
 
 
-def main(model_id, output_path, harmful_file="harmful.txt", 
-         harmless_file="harmless.txt", num_instructions=32):
+def main(model_id, output_path, harmful_file="harmful.txt",
+         harmless_file="harmless.txt", num_instructions=32, modify_mlp=True):
     """
     Main function to compute refusal direction and bake it into model weights.
     
@@ -182,6 +267,7 @@ def main(model_id, output_path, harmful_file="harmful.txt",
         harmful_file: Path to harmful instructions file
         harmless_file: Path to harmless instructions file
         num_instructions: Number of instruction samples to use
+        modify_mlp: Whether to also modify MLP layers (default: True, recommended)
     """
     print(f"Loading model: {model_id}")
     print("=" * 80)
@@ -236,7 +322,9 @@ def main(model_id, output_path, harmful_file="harmful.txt",
     # Apply ablation to weights
     print("\nStep 3: Baking ablation into model weights")
     print("=" * 80)
-    apply_ablation_to_weights(model, refusal_dir)
+    if modify_mlp:
+        print("Note: Also modifying MLP layers (useful for MoE models)")
+    apply_ablation_to_weights(model, refusal_dir, modify_mlp=modify_mlp)
     
     # Save modified model
     print("\nStep 4: Saving modified model")
@@ -297,6 +385,18 @@ if __name__ == "__main__":
         default=32,
         help="Number of instruction samples to use (default: 32)"
     )
+    parser.add_argument(
+        "--modify_mlp",
+        action="store_true",
+        default=True,
+        help="Modify MLP layers in addition to attention (default: True, use --no-modify_mlp to disable)"
+    )
+    parser.add_argument(
+        "--no-modify_mlp",
+        dest="modify_mlp",
+        action="store_false",
+        help="Skip modifying MLP layers (only modify attention output)"
+    )
     
     args = parser.parse_args()
     main(
@@ -304,5 +404,6 @@ if __name__ == "__main__":
         args.output_path,
         args.harmful_file,
         args.harmless_file,
-        args.num_instructions
+        args.num_instructions,
+        args.modify_mlp
     )
